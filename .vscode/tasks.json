@@ -1,0 +1,37 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Start docker compose (api, worker, redis, mongo)",
+			"type": "shell",
+			"command": "docker compose up -d",
+			"args": [],
+			"isBackground": false,
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Docker compose up",
+			"type": "shell",
+			"command": "docker compose up -d",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Docker compose up after fixes",
+			"type": "shell",
+			"command": "docker compose up -d",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Docker compose up after clean rewrite",
+			"type": "shell",
+			"command": "docker compose up -d",
+			"isBackground": false,
+			"group": "build"
+		}
+	]
+}
