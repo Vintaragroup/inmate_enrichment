@@ -1,5 +1,7 @@
 # Inmate Enrichment Module
 
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/Vintaragroup/inmate_enrichment?quickstart=1)
+
 Production-ready enrichment pipeline for inmate records with manual and automatic triggers.
 
 ## Stack
@@ -54,6 +56,10 @@ This checks /health and calls /api/enrichment/related_party_pull with a tiny pay
 ## GitHub Codespaces
 
 This repo includes a dev container for Codespaces in `.devcontainer/devcontainer.json`.
+
+One‑click launch:
+
+[Open in GitHub Codespaces](https://codespaces.new/Vintaragroup/inmate_enrichment?quickstart=1)
 
 What it does:
 - Uses Node 20 image
