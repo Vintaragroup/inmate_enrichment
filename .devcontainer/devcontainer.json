@@ -2,7 +2,9 @@
   "name": "Inmate Enrichment (Codespaces)",
   "image": "mcr.microsoft.com/devcontainers/javascript-node:20",
   "features": {
-    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "moby": false
+    }
   },
   "forwardPorts": [4000],
   "portsAttributes": {
@@ -14,7 +16,7 @@
   "containerEnv": {
     "PORT": "4000"
   },
-  "postCreateCommand": "npm ci || npm install && npm run stack:up",
+  "postCreateCommand": "(npm ci || npm install) && npm run stack:up",
   "postStartCommand": "npm run stack:up",
   "customizations": {
     "vscode": {
