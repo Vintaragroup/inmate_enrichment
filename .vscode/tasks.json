@@ -7,9 +7,6 @@
 			"command": "docker compose up -d",
 			"args": [],
 			"isBackground": false,
-			"problemMatcher": [
-				"$gcc"
-			],
 			"group": "build"
 		},
 		{
@@ -31,6 +28,92 @@
 			"type": "shell",
 			"command": "docker compose up -d",
 			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "api: up (stack:up)",
+			"type": "shell",
+			"command": "npm run stack:up",
+			"options": {
+				"cwd": "/Users/ryanmorrow/Documents/Projects2025/Data_General/Inmate_enrichment"
+			},
+			"isBackground": false,
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "api: rebuild (stack:rebuild)",
+			"type": "shell",
+			"command": "npm run stack:rebuild",
+			"options": {
+				"cwd": "/Users/ryanmorrow/Documents/Projects2025/Data_General/Inmate_enrichment"
+			},
+			"isBackground": false,
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "dashboard: dev",
+			"type": "shell",
+			"command": "npm run dev",
+			"options": {
+				"cwd": "/Users/ryanmorrow/Documents/Projects2025/WarrentDB/Bail-Bonds-Dashboard"
+			},
+			"isBackground": true,
+			"group": "build",
+			"problemMatcher": []
+		},
+		{
+			"label": "dev: api+dashboard",
+			"dependsOrder": "sequence",
+			"dependsOn": [
+				"api: up (stack:up)",
+				"dashboard: dev"
+			]
+		},
+		{
+			"label": "api: rebuild (stack:rebuild)",
+			"type": "shell",
+			"command": "npm run stack:rebuild",
+			"args": [],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "api: rebuild (stack:rebuild)",
+			"type": "shell",
+			"command": "npm run stack:rebuild",
+			"args": [],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "api: rebuild (stack:rebuild)",
+			"type": "shell",
+			"command": "npm run stack:rebuild",
+			"args": [],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "api: rebuild (stack:rebuild)",
+			"type": "shell",
+			"command": "npm run stack:rebuild",
+			"args": [],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "api: rebuild (stack:rebuild)",
+			"type": "shell",
+			"command": "npm run stack:rebuild",
+			"args": [],
+			"isBackground": false,
+			"problemMatcher": [],
 			"group": "build"
 		}
 	]

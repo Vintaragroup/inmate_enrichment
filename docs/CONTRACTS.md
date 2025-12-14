@@ -49,3 +49,20 @@ This document defines the provider enrichment contracts used by the worker pipel
 ## Guardrails
 - Rate limits per provider with exponential backoff + jitter
 - Budget caps per run and per hour/day (stop enqueueing/processing when exceeded)
+
+## Enrichment-owned providers enumeration (UI integration)
+
+- Endpoint: `GET /api/enrichment/providers`
+- Purpose: Allow the UI to source available providers directly from enrichment based on `.env` keys and feature toggles, avoiding a Dashboard-side registry.
+- Response (shape):
+  - `{ ok: boolean, providers: Array<{ id: string, label: string, enabled: boolean, ttlHours?: number, capabilities: Record<string, boolean>, actions: Array<{ id: string, method: string, path: string, description?: string }>, tests: Array<{ method: string, path: string }> }> }`
+- Typical providers:
+  - `pipl` (capabilities: matchScore, relationships, contacts)
+  - `whitepages` (capabilities: phoneValidation)
+  - `pdl` (capabilities: relationships, contacts)
+
+### Recommended UI workflow
+1) Fetch `/api/enrichment/providers` and render only `enabled === true`.
+2) When user selects `pipl`, call `POST /api/enrichment/pipl_first_pull { subjectId }`.
+3) On success, auto-apply results to CRM without overwriting existing fields; append relations as contacts (de-dup).
+4) Refresh Case detail and show a brief success toast summarizing additions (phones/emails/contacts).

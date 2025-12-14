@@ -15,6 +15,10 @@
     "lint": "npm -ws run lint",
     "stack:up": "node tools/ensure_stack.js",
     "stack:rebuild": "node tools/ensure_stack.js --rebuild",
+    "stack:down": "docker compose down",
+    "stack:status": "docker compose ps",
+    "stack:logs": "docker compose logs --no-color --tail=200 api worker",
+    "stack:restart": "docker compose restart api worker",
     "phones:validate": "node tools/validate_related_phones.js",
     "smoke": "node tools/smoke.js"
   },

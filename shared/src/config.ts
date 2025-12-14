@@ -46,4 +46,6 @@ export const config = {
     pdlUnitCostUsd: Number(process.env.PDL_UNIT_COST_USD || 0),
   piplUnitCostUsd: Number(process.env.PIPL_UNIT_COST_USD || 0),
     wpUnitCostUsd: Number(process.env.WP_UNIT_COST_USD || 0),
+    // Enrichment behavior toggles
+    partyPullPreferStatewide: (process.env.PARTY_PULL_PREFER_STATEWIDE || 'false').toLowerCase() === 'true',
 };

@@ -44,7 +44,7 @@ async function piplQuery({ key, first, last, city, state }){
   const has = (k) => args.includes('--'+k);
   const max = Math.max(1, Math.min(10, getNum('max', 3)));
   const requireUnique = has('unique');
-  const matchMin = getNum('min', 0.85);
+  const matchMin = getNum('min', Number(process.env.HIGH_QUALITY_MATCH || 0.75));
 
   const key = process.env.PIPL_API_KEY;
   if (!key) { console.error('Missing PIPL_API_KEY'); process.exit(2); }

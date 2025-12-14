@@ -85,3 +85,19 @@ export function deriveLocationFromAddress(addr: any, fallbacks?: { city?: string
   }
   return { city, state, zip };
 }
+
+// Coerce provider match values to a consistent numeric type
+// - Accepts numbers or numeric strings (e.g., "0", "0.85")
+// - Returns a finite number in [0, 1] when possible; otherwise null
+export function normalizeMatch(v: any): number | null {
+  if (v == null) return null;
+  if (typeof v === 'string') {
+    const s = v.trim();
+    if (!s) return null;
+  }
+  const n = typeof v === 'number' ? v : (typeof v === 'string' ? Number(v.trim()) : NaN);
+  if (!Number.isFinite(n)) return null;
+  // clamp to [0,1] to avoid accidental percentages or out-of-range values
+  const clamped = Math.max(0, Math.min(1, n));
+  return clamped;
+}

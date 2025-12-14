@@ -2,10 +2,15 @@ import { Router } from 'express';
 import { Queue } from 'bullmq';
 import IORedis from 'ioredis';
 import mongoose from 'mongoose';
-import { config, logger, getIngestionTimestamp, isWithinWindow } from '@inmate/shared';
+import { config, logger, getIngestionTimestamp, isWithinWindow, normalizeMatch } from '@inmate/shared';
 import { InmateModel, EnrichmentJobModel, RawProviderPayloadModel, RelatedPartyModel } from '@inmate/shared';
 import { buildPartyId } from '@inmate/shared';
 import axios from 'axios';
+
+// Shared default for high-quality match threshold (0-1)
+const DEFAULT_MATCH_MIN = Number(process.env.HIGH_QUALITY_MATCH ?? '0.75');
+// Cooldown window (minutes) for targeted related-party pulls
+const PARTY_PULL_COOLDOWN_MINUTES = Math.max(0, Number(process.env.PARTY_PULL_COOLDOWN_MINUTES ?? '30'));
 
 async function whitepagesLookupLocal({ phones }: { phones: string[] }) {
   if (!((config as any).providerWhitepagesEnabled && config.whitepagesApiKey)) {
@@ -152,6 +157,35 @@ export async function createServer() {
       res.status(500).json({ ok: false, error: String(e) });
     }
   });
+  // Last stored Whitepages payload (preview) optionally filtered by subjectId
+  router.get('/providers/whitepages/last', async (req: any, res: any) => {
+    try {
+      const step = String(req.query.step || '').trim();
+      const q: any = { provider: 'whitepages' };
+      const subjectId = String(req.query.subjectId || '').trim();
+      if (subjectId) q.subjectId = subjectId;
+      if (step) q.step = step;
+      const doc: any = await RawProviderPayloadModel.findOne(q).sort({ createdAt: -1 }).lean();
+      if (!doc) return res.status(404).json({ ok: false, error: 'NO_PAYLOAD' });
+      const payload = (doc as any)?.payload || {};
+      res.json({ ok: true, when: (doc as any)?.createdAt || null, step: (doc as any)?.step || null, keys: Object.keys(payload), preview: JSON.stringify(payload).slice(0, 4000) });
+    } catch (e: any) {
+      res.status(500).json({ ok: false, error: String(e) });
+    }
+  });
+  // Full Whitepages payload for a subject (most recent)
+  router.get('/providers/whitepages/raw', async (req: any, res: any) => {
+    try {
+      const subjectId = String(req.query.subjectId || '').trim();
+      if (!subjectId) return res.status(400).json({ ok: false, error: 'MISSING_SUBJECT_ID' });
+      const doc: any = await RawProviderPayloadModel.findOne({ provider: 'whitepages', subjectId }).sort({ createdAt: -1 }).lean();
+      if (!doc) return res.status(404).json({ ok: false, error: 'NO_PAYLOAD' });
+      const payload = (doc as any)?.payload || {};
+      res.json({ ok: true, when: (doc as any)?.createdAt || null, step: (doc as any)?.step || null, payload });
+    } catch (e: any) {
+      res.status(500).json({ ok: false, error: String(e) });
+    }
+  });
   router.get('/providers/pipl/test', async (_req: any, res: any) => {
     try {
       if (!(config as any).piplApiKey || !(config as any).providerPiplEnabled) return res.status(400).json({ ok: false, reason: 'DISABLED_OR_MISSING_KEY' });
@@ -164,12 +198,55 @@ export async function createServer() {
     try {
       const step = String(req.query.step || '').trim();
       const q: any = { provider: 'pipl' };
+      const subjectId = String(req.query.subjectId || '').trim();
+      if (subjectId) q.subjectId = subjectId;
       if (step) q.step = step;
   const doc: any = await RawProviderPayloadModel.findOne(q).sort({ createdAt: -1 }).lean();
   if (!doc) return res.status(404).json({ ok: false, error: 'NO_PAYLOAD' });
   const payload = (doc as any)?.payload || {};
   // Avoid huge payloads in response
   res.json({ ok: true, when: (doc as any)?.createdAt || null, step: (doc as any)?.step || null, keys: Object.keys(payload), preview: JSON.stringify(payload).slice(0, 4000) });
+    } catch (e: any) {
+      res.status(500).json({ ok: false, error: String(e) });
+    }
+  });
+  // Raw Pipl payload (full) for a specific subject (for visualization/review)
+  router.get('/providers/pipl/raw', async (req: any, res: any) => {
+    try {
+      const subjectId = String(req.query.subjectId || '').trim();
+      if (!subjectId) return res.status(400).json({ ok: false, error: 'MISSING_SUBJECT_ID' });
+      const doc: any = await RawProviderPayloadModel.findOne({ provider: 'pipl', subjectId }).sort({ createdAt: -1 }).lean();
+      if (!doc) return res.status(404).json({ ok: false, error: 'NO_PAYLOAD' });
+      const payload = (doc as any)?.payload || {};
+      const resp = (payload && payload.response) ? payload.response : payload;
+      res.json({ ok: true, when: (doc as any)?.createdAt || null, step: (doc as any)?.step || null, response: resp, request: (payload && payload.request) || null });
+    } catch (e: any) {
+      res.status(500).json({ ok: false, error: String(e) });
+    }
+  });
+
+  // Normalized Pipl matches for a subject (for UI tables)
+  router.get('/enrichment/pipl_matches', async (req: any, res: any) => {
+    try {
+      const subjectId = String(req.query.subjectId || '').trim();
+      if (!subjectId) return res.status(400).json({ ok: false, error: 'MISSING_SUBJECT_ID' });
+      const doc: any = await RawProviderPayloadModel.findOne({ provider: 'pipl', subjectId }).sort({ createdAt: -1 }).lean();
+      if (!doc) return res.status(404).json({ ok: false, error: 'NO_PAYLOAD' });
+      const payload = (doc as any)?.payload || {};
+      const resp = (payload && payload.response) ? payload.response : payload;
+      const persons: any[] = Array.isArray(resp?.possible_persons) ? resp.possible_persons : (resp?.person ? [resp.person] : []);
+      const rows = persons.map((p: any, idx: number) => {
+        const name = (Array.isArray(p?.names) && p.names[0]) ? (p.names[0].display || [p.names[0].first, p.names[0].last].filter(Boolean).join(' ')) : null;
+        const m = typeof p?.['@match'] === 'number' ? p['@match'] : (typeof resp?.['@match'] === 'number' ? resp['@match'] : null);
+        const phones = Array.isArray(p?.phones) ? p.phones.map((pp: any) => pp?.display_international || pp?.number || String(pp)).filter(Boolean) : [];
+        const emails = Array.isArray(p?.emails) ? p.emails.map((e: any) => e?.address || String(e)).filter(Boolean) : [];
+        const addresses = Array.isArray(p?.addresses)
+          ? p.addresses.map((a: any) => a?.display || [a?.street, a?.city, a?.state, a?.postal_code || a?.zip, a?.country].filter(Boolean).join(', ')).filter(Boolean)
+          : [];
+        const usernames = Array.isArray(p?.usernames) ? p.usernames : [];
+        return { idx, name, match: m, phones, emails, addresses, usernames };
+      });
+      res.json({ ok: true, count: rows.length, rows });
     } catch (e: any) {
       res.status(500).json({ ok: false, error: String(e) });
     }
@@ -215,7 +292,7 @@ export async function createServer() {
         search_id: data?.['@search_id'] || null,
         available_data: data?.available_data?.premium || null,
       };
-      try { await RawProviderPayloadModel.create({ provider: 'pipl', step: 'pipl_ad_hoc', payload: { request: { person }, response: data }, ttlExpiresAt: new Date(Date.now() + (config as any).rawPayloadTtlHours * 3600 * 1000) }); } catch {}
+  try { await RawProviderPayloadModel.create({ provider: 'pipl', step: 'pipl_ad_hoc', payload: { request: { person }, response: data }, ttlExpiresAt: new Date(Date.now() + (config as any).rawPayloadTtlHours * 3600 * 1000) }); } catch {}
       res.json({ ok: true, request: { person }, summary });
     } catch (e: any) {
       res.status(500).json({ ok: false, error: String(e) });
@@ -465,11 +542,25 @@ export async function createServer() {
       const total = filtered.length;
       let rows: any[] = [];
       if (limit > 0) {
-        rows = filtered.slice(0, limit).map((d: any) => {
+        const limited = filtered.slice(0, limit);
+        const ids = limited.map((d: any) => String(d.spn || d.subject_id || d.subjectId)).filter(Boolean);
+        // Batch aggregate enrichment job counts per subject
+        const jobCounts = await EnrichmentJobModel.aggregate([
+          { $match: { subjectId: { $in: ids } } },
+          { $group: { _id: '$subjectId', count: { $sum: 1 } } },
+        ]);
+        const jobCountById = new Map<string, number>(jobCounts.map((j: any) => [String(j._id), Number(j.count) || 0]));
+        // Batch aggregate related party counts per subject
+        const relCounts = await RelatedPartyModel.aggregate([
+          { $match: { subjectId: { $in: ids } } },
+          { $group: { _id: '$subjectId', count: { $sum: 1 } } },
+        ]);
+        const relCountById = new Map<string, number>(relCounts.map((r: any) => [String(r._id), Number(r.count) || 0]));
+
+        rows = limited.map((d: any) => {
           const subjectId = d.spn || d.subject_id || d.subjectId;
           const bondVal = typeof d.bond_amount === 'number' ? d.bond_amount : (typeof d.bond === 'number' ? d.bond : null);
           const bAt = bestBooking(d);
-          const txt = String(d?.hcso_status?.bondExceptionText || '');
           const strong = strongNotBondable(d);
           const baseAddr = (d.address || d.addr || null);
           const baseCity = d.city || null; const baseState = d.state || null; const baseZip = d.zip || null;
@@ -487,7 +578,22 @@ export async function createServer() {
             return String(addr).trim();
           };
           const baseAddressSnippet = (toAddrString(baseAddr) || [baseCity, baseState, baseZip].filter(Boolean).join(', ')) || null;
-          return { subjectId: String(subjectId), bond: bondVal, dob: d.dob || null, bookingDate: bAt ? bAt.toISOString() : null, notBondable: !!d?.hcso_status?.notBondable, notBondableStrict: strong, moreChargesPossible: !!d?.hcso_status?.moreChargesPossible, bondExceptionText: d?.hcso_status?.bondExceptionText || null, baseAddressSnippet: baseAddressSnippet || null };
+          const sid = String(subjectId);
+          const enrichmentCount = jobCountById.get(sid) || 0;
+          const relationsCount = relCountById.get(sid) || 0;
+          return {
+            subjectId: sid,
+            bond: bondVal,
+            dob: d.dob || null,
+            bookingDate: bAt ? bAt.toISOString() : null,
+            notBondable: !!d?.hcso_status?.notBondable,
+            notBondableStrict: strong,
+            moreChargesPossible: !!d?.hcso_status?.moreChargesPossible,
+            bondExceptionText: d?.hcso_status?.bondExceptionText || null,
+            baseAddressSnippet: baseAddressSnippet || null,
+            enrichmentCount,
+            relationsCount,
+          };
         });
       }
       res.json({ windowHours, minBond, includeNotBondable, total, excludedStrictNotBondable, moreChargesPossibleCount: moreChargesCount, count: rows.length, rows });
@@ -584,27 +690,77 @@ export async function createServer() {
   const job: any = await EnrichmentJobModel.findOne({ subjectId: String(spn) }).sort({ updatedAt: -1 }).lean();
   const steps = (job?.steps || []).map((s: any) => ({ name: s.name, status: s.status, info: s.info }));
       // related parties
-      const parties = await RelatedPartyModel.find({ subjectId: String(spn) }).limit(10).lean();
+      const parties = await RelatedPartyModel.find({ subjectId: String(spn) }).limit(50).lean();
+      // Heuristic: prefer family label when last names match and no explicit label present
+      const getSubjLast = () => {
+        const ln = String(((subject as any)?.last_name || '')).trim();
+        if (ln) return ln;
+        const nm = String(((subject as any)?.name || '')).trim();
+        if (nm) { const parts = nm.split(/\s+/).filter(Boolean); return parts[parts.length - 1] || ''; }
+        return '';
+      };
+      const norm = (s: string) => s.toLowerCase().replace(/[^a-z]/g,'').replace(/(.)\1+/g,'$1');
+      const subjLastNorm = norm(getSubjLast());
       const rel = parties.map((p: any) => {
         const audits = Array.isArray((p as any).audits) ? (p as any).audits : [];
         const lastAudit = audits.length ? audits[audits.length - 1] : null;
-        const auditLite = lastAudit ? { at: lastAudit.at, provider: lastAudit.provider, personsCount: lastAudit.personsCount, match: lastAudit.match, accepted: lastAudit.accepted, acceptance: lastAudit.acceptance, lastNameAgrees: lastAudit.lastNameAgrees, matchMin: lastAudit.matchMin, requireUnique: lastAudit.requireUnique } : null;
-        return ({ name: p.name, relationType: p.relationType, confidence: p.confidence, lastAudit: auditLite });
+  const auditLite = lastAudit ? { at: lastAudit.at, provider: lastAudit.provider, personsCount: lastAudit.personsCount, match: normalizeMatch((lastAudit as any).match), accepted: lastAudit.accepted, acceptance: lastAudit.acceptance, lastNameAgrees: lastAudit.lastNameAgrees, matchMin: lastAudit.matchMin, requireUnique: lastAudit.requireUnique, gainedData: (lastAudit as any).gainedData ?? null, netNewPhones: (lastAudit as any).netNewPhones ?? null, netNewEmails: (lastAudit as any).netNewEmails ?? null, netNewAddresses: (lastAudit as any).netNewAddresses ?? null } : null;
+        const lastTargeted = audits.filter((a: any) => a && a.targeted === true).pop() || null;
+        const lastTargetedAt = lastTargeted?.at ? new Date(lastTargeted.at) : null;
+        const cooldownEndsAt = (lastTargetedAt && PARTY_PULL_COOLDOWN_MINUTES)
+          ? new Date(lastTargetedAt.getTime() + PARTY_PULL_COOLDOWN_MINUTES * 60 * 1000)
+          : null;
+        const phones = Array.isArray((p as any)?.contacts?.phones) ? (p as any).contacts.phones : [];
+        const emails = Array.isArray((p as any)?.contacts?.emails) ? (p as any).contacts.emails : [];
+        const addresses = Array.isArray((p as any)?.addresses) ? (p as any).addresses : [];
+        let relationType = p.relationType;
+        let relationLabel = (p as any).relationLabel || null;
+        if ((!relationLabel || relationLabel.toLowerCase() === 'associate') && subjLastNorm && p?.name) {
+          const parts = String(p.name).split(/\s+/); const last = parts[parts.length-1]||'';
+          if (norm(last) === subjLastNorm) { relationType = 'family'; relationLabel = relationLabel || 'family'; }
+        }
+        return ({ partyId: (p as any).partyId || null, name: p.name, relationType, relationLabel, confidence: p.confidence, lastAudit: auditLite, lastTargetedAt, cooldownEndsAt, phones, emails, addresses });
       });
-      // last Pipl payload preview
-      const lastPipl = await RawProviderPayloadModel.findOne({ provider: 'pipl' }).sort({ createdAt: -1 }).lean();
+      // Last Pipl payload preview scoped to this subject when available
+      const lastPipl = await RawProviderPayloadModel
+        .findOne({ provider: 'pipl', subjectId: String(spn) })
+        .sort({ createdAt: -1 })
+        .lean()
+        || await RawProviderPayloadModel.findOne({ provider: 'pipl' }).sort({ createdAt: -1 }).lean();
       const piplPreview = lastPipl ? (() => {
         try {
           const payload = (lastPipl as any).payload || {};
-          const matches = payload?.data?.matches || [];
-          const addrPreview = matches.slice(0, 2).map((m: any) => (m.addresses||[]).slice(0,1).map((a: any)=> a.display || a.street || '').join(''));
-          return { when: (lastPipl as any).createdAt || null, matches: matches.length, addrPreview };
-        } catch { return { when: (lastPipl as any).createdAt || null, matches: 0 }; }
+          const resp = (payload && payload.response) ? payload.response : payload; // we store {request,response}
+          // Pipl returns either person or possible_persons
+          const personsRaw: any[] = Array.isArray((resp as any)?.possible_persons)
+            ? (resp as any).possible_persons
+            : ((resp as any)?.person ? [(resp as any).person] : []);
+          const samples = personsRaw.slice(0, 2).map((p: any) => {
+            const name = (Array.isArray(p?.names) && p.names[0])
+              ? (p.names[0].display || [p.names[0].first, p.names[0].last].filter(Boolean).join(' ').trim())
+              : undefined;
+            const addrObj = Array.isArray(p?.addresses) && p.addresses[0] ? p.addresses[0] : undefined;
+            const address = addrObj?.display || [addrObj?.street, addrObj?.city, addrObj?.state, addrObj?.postal_code || addrObj?.zip, addrObj?.country]
+              .filter(Boolean)
+              .join(', ');
+            const match = typeof p?.['@match'] === 'number' ? p['@match'] : (typeof (resp as any)?.['@match'] === 'number' ? (resp as any)['@match'] : undefined);
+            return { name: name || null, address: (address || '').trim() || null, match: match ?? null };
+          });
+          return { when: (lastPipl as any).createdAt || null, personsCount: personsRaw.length, samples };
+        } catch {
+          return { when: (lastPipl as any).createdAt || null, personsCount: 0, samples: [] };
+        }
       })() : null;
       const facts = (subject as any).facts || {};
+      // Prefer full name when available; if missing, fall back to the last Pipl payload's first person name
+      let displayName = [ (subject as any).first_name, (subject as any).last_name ].filter(Boolean).join(' ').trim() || (subject as any).name || '';
+      if (!displayName && piplPreview && Array.isArray((piplPreview as any).samples) && (piplPreview as any).samples[0]?.name) {
+        displayName = String((piplPreview as any).samples[0].name || '').trim();
+      }
+      const safeName = displayName || null;
       const summary = {
         subjectId: String(spn),
-        name: [ (subject as any).first_name, (subject as any).last_name ].filter(Boolean).join(' ').trim() || null,
+        name: safeName,
         dob: (subject as any).dob || null,
         bond: (subject as any).bond_amount ?? (subject as any).bond ?? null,
         baseAddress: baseAddrSnippet,
@@ -616,7 +772,43 @@ export async function createServer() {
         relatedParties: rel,
         piplPreview,
       };
-      res.json({ ok: true, summary });
+      // For UI compatibility: also expose a flat shape with legacy keys
+  const related_parties = rel.map((r: any) => ({ partyId: r.partyId || null, name: r.name, relation: r.relationType, relationLabel: r.relationLabel || null, phones: r.phones || [], emails: r.emails || [], addresses: r.addresses || [], match: normalizeMatch(r?.lastAudit?.match), accepted: r?.lastAudit?.accepted ?? null, netNewPhones: r?.lastAudit?.netNewPhones ?? null, netNewEmails: r?.lastAudit?.netNewEmails ?? null, netNewAddresses: r?.lastAudit?.netNewAddresses ?? null }));
+      // Subject-level provider summaries
+      // Subject-level provider summaries
+      let pipl = (subject as any)?.pipl || null;
+      // Fallback: derive a minimal pipl summary from the latest raw payload if subject.pipl is missing
+      if (!pipl && lastPipl) {
+        try {
+          const payload = (lastPipl as any).payload || {};
+          const resp = (payload && payload.response) ? payload.response : payload;
+          const personsRaw: any[] = Array.isArray((resp as any)?.possible_persons)
+            ? (resp as any).possible_persons
+            : ((resp as any)?.person ? [(resp as any).person] : []);
+          let best: any = null; let bestM = -1;
+          for (const p of personsRaw) {
+            const m = typeof p?.['@match'] === 'number' ? p['@match'] : (typeof (resp as any)?.['@match'] === 'number' ? (resp as any)['@match'] : 0);
+            if (m > bestM) { bestM = m; best = p; }
+          }
+          if (best) {
+            const phones = Array.isArray(best?.phones) ? best.phones.map((pp: any) => pp?.display_international || pp?.number || String(pp)).filter(Boolean) : [];
+            const emails = Array.isArray(best?.emails) ? best.emails.map((e: any) => e?.address || String(e)).filter(Boolean) : [];
+            const addresses = Array.isArray(best?.addresses)
+              ? best.addresses.map((a: any) => a?.display || [a?.street, a?.city, a?.state, a?.postal_code || a?.zip, a?.country].filter(Boolean).join(', ')).filter(Boolean)
+              : [];
+            pipl = { asOf: (lastPipl as any).createdAt || new Date().toISOString(), matchScore: bestM >= 0 ? bestM : null, phones, emails, addresses } as any;
+          }
+        } catch {}
+      }
+      const pdl = (subject as any)?.pdl || null;
+      const piplLegacy = (() => {
+        if (!piplPreview) return null;
+        const samples = Array.isArray((piplPreview as any).samples) ? (piplPreview as any).samples : [];
+        const addrPreview = samples.map((s: any) => s?.address).filter(Boolean).slice(0, 2);
+        const matches = typeof (piplPreview as any).personsCount === 'number' ? (piplPreview as any).personsCount : samples.length;
+        return { when: (piplPreview as any).when || null, matches, addrPreview };
+      })();
+  res.json({ ok: true, summary, facts, related_parties, pipl, pdl, piplPreview: piplLegacy ?? piplPreview });
     } catch (e: any) {
       res.status(500).json({ error: String(e) });
     }
@@ -913,6 +1105,56 @@ export async function createServer() {
     }
   });
 
+  // GET /api/enrichment/providers -> enumerate enrichment-owned providers for UI dropdowns
+  // Returns all known providers with enabled flags and basic capabilities so the UI can avoid
+  // coupling to the Dashboard server registry.
+  router.get('/enrichment/providers', async (_req: any, res: any) => {
+    try {
+      const piplEnabled = !!((config as any).providerPiplEnabled && (config as any).piplApiKey);
+      const wpEnabled = !!((config as any).providerWhitepagesEnabled && (config as any).whitepagesApiKey);
+      const pdlEnabled = !!((config as any).providerPdlEnabled && (config as any).pdlApiKey);
+      const providers = [
+        {
+          id: 'pipl',
+          label: 'Pipl',
+          enabled: piplEnabled,
+          ttlHours: (config as any).rawPayloadTtlHours ?? 24,
+          capabilities: { matchScore: true, relationships: true, contacts: true },
+          actions: [
+            { id: 'first_pull', method: 'POST', path: '/api/enrichment/pipl_first_pull', description: 'Find best match and update subject facts/relationships' },
+            { id: 'party_pull', method: 'POST', path: '/api/enrichment/related_party_pull', description: 'Enrich related parties by name + location' },
+          ],
+          tests: [ { method: 'GET', path: '/api/providers/pipl/test' } ],
+        },
+        {
+          id: 'whitepages',
+          label: 'Whitepages Pro',
+          enabled: wpEnabled,
+          ttlHours: (config as any).rawPayloadTtlHours ?? 24,
+          capabilities: { phoneValidation: true },
+          actions: [
+            { id: 'validate_party_phones', method: 'POST', path: '/api/enrichment/related_party_validate_phones', description: 'Validate stored related-party phones' },
+          ],
+          tests: [ { method: 'GET', path: '/api/providers/whitepages/test' } ],
+        },
+        {
+          id: 'pdl',
+          label: 'People Data Labs',
+          enabled: pdlEnabled,
+          ttlHours: (config as any).rawPayloadTtlHours ?? 24,
+          capabilities: { relationships: true, contacts: true },
+          actions: [
+            { id: 'first_pull', method: 'POST', path: '/api/enrichment/pdl_first_pull', description: 'Find best match and update subject facts/relationships' },
+          ],
+          tests: [ { method: 'GET', path: '/api/providers/pdl/test' } ],
+        },
+      ];
+      res.json({ ok: true, providers });
+    } catch (e: any) {
+      res.status(500).json({ ok: false, error: String(e) });
+    }
+  });
+
   // GET /api/enrichment/provider_unresolved_breakdown?windowHours=24
   router.get('/enrichment/provider_unresolved_breakdown', async (req: any, res: any) => {
     try {
@@ -940,19 +1182,105 @@ export async function createServer() {
     }
   });
 
-  // POST /api/enrichment/pipl_first_pull { subjectId?: string, overrideLocation?: boolean }
+  // GET /api/enrichment/crm_suggestions?subjectId=SPN
+  // Returns a suggested CRM patch derived from subject facts and related parties
+  router.get('/enrichment/crm_suggestions', async (req: any, res: any) => {
+    try {
+      const subjectId = String(req.query.subjectId || '').trim();
+      if (!subjectId) return res.status(400).json({ ok: false, error: 'MISSING_SUBJECT_ID' });
+      const subject = await InmateModel.findOne({ $or: [{ spn: subjectId }, { subject_id: subjectId }, { subjectId }] }, { facts: 1, address: 1, addr: 1, city: 1, state: 1, zip: 1, first_name: 1, last_name: 1, pdl: 1 }).lean();
+      if (!subject) return res.status(404).json({ ok: false, error: 'SUBJECT_NOT_FOUND' });
+      const facts = (subject as any).facts || {};
+      function pickFirst(arr: any[]): string | null { if (!Array.isArray(arr)) return null; for (const v of arr) { const s = String(v ?? '').trim(); if (s) return s; } return null; }
+      // Base address if facts are empty
+      function toAddrString(addr: any, fallbacks: any) {
+        if (!addr) return '';
+        if (typeof addr === 'string') return addr.trim();
+        if (typeof addr === 'object') {
+          const l1 = addr.line1 || addr.address1 || addr.street || addr.addr || '';
+          const l2 = addr.line2 || addr.address2 || addr.unit || '';
+          const c = addr.city || fallbacks.city || '';
+          const st = addr.state || fallbacks.state || '';
+          const zp = addr.zip || addr.postal_code || fallbacks.zip || '';
+          return [l1, l2, c, st, zp].filter(Boolean).join(', ').replace(/,\s*,/g, ', ').trim();
+        }
+        return String(addr).trim();
+      }
+      const fallbackAddr = toAddrString((subject as any).address || (subject as any).addr, { city: (subject as any).city, state: (subject as any).state, zip: (subject as any).zip })
+        || [ (subject as any).city, (subject as any).state, (subject as any).zip ].filter(Boolean).join(', ');
+      const sugPhone = pickFirst((facts as any).phones || ((subject as any).pdl?.phones) || []);
+      const sugEmail = pickFirst((facts as any).emails || ((subject as any).pdl?.emails) || []);
+      const sugAddr = pickFirst((facts as any).addresses) || fallbackAddr || null;
+      // Employer/jobTitle are not populated in this pipeline yet; leave null for now
+      const sugEmployer = (facts as any).employer || null;
+      const sugJobTitle = (facts as any).jobTitle || null;
+      // Contacts from related parties
+      const parties = await RelatedPartyModel.find({ subjectId: String(subjectId) }, { name: 1, relationType: 1, contacts: 1 }).sort({ updatedAt: -1 }).limit(20).lean();
+      const contacts: any[] = [];
+      const seen = new Set<string>();
+      for (const p of parties) {
+        const name = String((p as any).name || '').trim();
+        if (!name || seen.has(name)) continue;
+        seen.add(name);
+        const rel = (p as any).relationType || null;
+        const ph = Array.isArray((p as any)?.contacts?.phones) ? (p as any).contacts.phones.find((x: any) => String(x || '').trim()) : null;
+        const em = Array.isArray((p as any)?.contacts?.emails) ? (p as any).contacts.emails.find((x: any) => String(x || '').trim()) : null;
+        contacts.push({ name, relation: rel, phone: ph || null, email: em || null });
+        if (contacts.length >= 10) break;
+      }
+      const suggestions = { phone: sugPhone, email: sugEmail, address: sugAddr || null, employer: sugEmployer, jobTitle: sugJobTitle, contacts };
+      const sources = {
+        phone: ((facts as any).phones?.length ? 'facts' : ((subject as any).pdl?.phones?.length ? 'pdl' : null)),
+        email: ((facts as any).emails?.length ? 'facts' : ((subject as any).pdl?.emails?.length ? 'pdl' : null)),
+        address: ((facts as any).addresses?.length ? 'facts' : (fallbackAddr ? 'base' : null)),
+        contacts: parties.length ? 'related_parties' : null,
+      };
+      res.json({ ok: true, subjectId: String(subjectId), suggestions, sources });
+    } catch (e: any) {
+      res.status(500).json({ ok: false, error: String(e) });
+    }
+  });
+
+  // POST /api/enrichment/pipl_first_pull { subjectId?: string, overrideLocation?: boolean, aggressive?: boolean }
+  // By default, performs a single strict attempt (name + dob + full address). When aggressive=true, runs up to two
+  // additional fallbacks (state-only, then name-only) if earlier attempts return no persons.
   router.post('/enrichment/pipl_first_pull', async (req: any, res: any) => {
     try {
       if (!(config as any).piplApiKey || !(config as any).providerPiplEnabled) return res.status(400).json({ ok: false, error: 'PIPL_DISABLED_OR_MISSING_KEY' });
-      let { subjectId, overrideLocation } = req.body as { subjectId?: string; overrideLocation?: boolean };
+      let { subjectId, overrideLocation, aggressive } = req.body as { subjectId?: string; overrideLocation?: boolean; aggressive?: boolean };
       if (!subjectId) return res.status(400).json({ ok: false, error: 'MISSING_SUBJECT_ID' });
       const subject = await InmateModel.findOne({ $or: [{ spn: subjectId }, { subject_id: subjectId }, { subjectId }] });
       if (!subject) return res.status(404).json({ ok: false, error: 'SUBJECT_NOT_FOUND' });
+      // Helper: extract the richest address we can for Pipl (street, city, state, postal_code, country)
+      function buildPiplAddressFromSubject(s: any) {
+        const baseCity = String(s.city || '').trim();
+        const baseState = String(s.state || '').trim();
+        const baseZip = String((s.zip || s.postal_code || '')).trim();
+        const baseCountry = 'US';
+        const defaultCity = 'Houston';
+        const defaultState = 'TX'; // Harris County, TX by default when missing
+        let street = '';
+        const raw = (s.address ?? s.addr) as any;
+        if (raw && typeof raw === 'object') {
+          const l1 = String(raw.line1 || raw.address1 || raw.street || raw.addr || '').trim();
+          const l2 = String(raw.line2 || raw.address2 || raw.unit || '').trim();
+          street = [l1, l2].filter(Boolean).join(' ').trim();
+        } else if (raw && typeof raw === 'string') {
+          street = raw.trim();
+        }
+        const city = (overrideLocation ? defaultCity : (baseCity || defaultCity));
+        const state = (overrideLocation ? defaultState : (baseState || defaultState));
+        const postal_code = baseZip || undefined;
+        const addr: any = { country: baseCountry };
+        if (street) addr.street = street;
+        if (city) addr.city = city;
+        if (state) addr.state = state;
+        if (postal_code) addr.postal_code = postal_code;
+        return addr;
+      }
   const pf = (subject as any).first_name || '';
   const pl = (subject as any).last_name || '';
   const sdob = (subject as any).dob || undefined;
-  const locCity = overrideLocation ? 'Houston' : ((subject as any).city || 'Houston');
-  const locState = overrideLocation ? 'TX' : ((subject as any).state || 'TX');
       const pPerson: any = {};
       if (pf || pl) pPerson.names = [{ first: pf, last: pl }];
       if (sdob) {
@@ -964,8 +1292,9 @@ export async function createServer() {
           }
         } catch {}
       }
-      const [cityVal, stateVal] = [((subject as any).city || 'Houston'), ((subject as any).state || 'TX')];
-      pPerson.addresses = [{ city: cityVal, state: stateVal, country: 'US' }];
+  // Include the richest address we have (street/city/state/postal_code/country)
+  const piplAddr = buildPiplAddressFromSubject(subject as any);
+  pPerson.addresses = [piplAddr];
       async function callPipl(personObj: any, attempt: number){
         const bodyReq = { key: (config as any).piplApiKey, person: personObj };
         const r = await fetch('https://api.pipl.com/search/', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(bodyReq) } as any);
@@ -975,24 +1304,26 @@ export async function createServer() {
           throw new Error(`PIPL_HTTP_${r.status}${errTxt ? ` ${String(errTxt).slice(0, 200)}`: ''}`);
         }
         const json = await r.json();
-        try { await RawProviderPayloadModel.create({ provider: 'pipl', step: 'pipl_first_pull', payload: { request: { person: personObj, attempt }, response: json }, ttlExpiresAt: new Date(Date.now() + (config as any).rawPayloadTtlHours * 3600 * 1000) }); } catch {}
+        try { await RawProviderPayloadModel.create({ provider: 'pipl', subjectId: String(subjectId), step: 'pipl_first_pull', payload: { request: { person: personObj, attempt }, response: json }, ttlExpiresAt: new Date(Date.now() + (config as any).rawPayloadTtlHours * 3600 * 1000) }); } catch {}
         return json;
       }
-      // Attempt 1: name + dob + city/state (strict)
+      // Attempt 1: name + dob + full address (strict)
       let body: any = await callPipl(pPerson, 1);
       const personsCount1 = Number(body?.['@persons_count'] || 0);
-      // Attempt 2: if none, try name + dob + state only
-      if (!personsCount1) {
+      // Only when explicitly requested (aggressive) do we try additional fallbacks
+      if (!personsCount1 && aggressive) {
+        const stateVal = String(piplAddr.state || 'TX');
         const p2 = { ...pPerson, addresses: [{ state: stateVal, country: 'US' }] };
         delete (p2 as any).addresses[0].city;
+        delete (p2 as any).addresses[0].street;
+        delete (p2 as any).addresses[0].postal_code;
         body = await callPipl(p2, 2);
-      }
-      const personsCount2 = Number(body?.['@persons_count'] || 0);
-      // Attempt 3: if still none, try name only (no dob/address)
-      if (!personsCount2) {
-        const p3: any = {};
-        if (pf || pl) p3.names = [{ first: pf, last: pl }];
-        body = await callPipl(p3, 3);
+        const personsCount2 = Number(body?.['@persons_count'] || 0);
+        if (!personsCount2) {
+          const p3: any = {};
+          if (pf || pl) p3.names = [{ first: pf, last: pl }];
+          body = await callPipl(p3, 3);
+        }
       }
       const toNorm = (p: any) => {
         const phones = Array.isArray(p?.phones) ? p.phones.map((pp: any)=>pp?.display_international || pp?.number || pp) : [];
@@ -1009,31 +1340,141 @@ export async function createServer() {
         matchesArr = [toNorm(body.person)];
       }
       const best = matchesArr.sort((a,b)=> (b.m||0) - (a.m||0) )[0] || { phones: [], emails: [], addresses: [], relationships: [], m: 0 };
-      const { phones, emails, addresses, relationships, m: matchScore } = best;
-  try { await RawProviderPayloadModel.create({ provider: 'pipl', step: 'pipl_first_pull', payload: { request: { person: pPerson }, response: body, bestScore: matchScore }, ttlExpiresAt: new Date(Date.now() + (config as any).rawPayloadTtlHours * 3600 * 1000) }); } catch {}
-      // Save to subject facts
+    const { phones, emails, addresses, relationships, m: matchScore } = best;
+  try { await RawProviderPayloadModel.create({ provider: 'pipl', subjectId: String(subjectId), step: 'pipl_first_pull_summary', payload: { phase: 'summary', request: { person: pPerson }, response: body, bestScore: matchScore }, ttlExpiresAt: new Date(Date.now() + (config as any).rawPayloadTtlHours * 3600 * 1000) }); } catch {}
+      // Persist to subject facts using atomic update to avoid silent schema issues
       try {
-        const f = subject.get('facts') || {};
-        f.phones = Array.from(new Set([...(f.phones || []), ...phones]));
-        f.emails = Array.from(new Set([...(f.emails || []), ...emails]));
-        f.addresses = Array.from(new Set([...(f.addresses || []), ...addresses.map((a: any)=>a?.street || a)]));
-        subject.set('facts', f);
-        await subject.save();
+        const phonesU = Array.from(new Set((phones || []).map((x: any)=> String(x||'').trim()).filter(Boolean))).slice(0, 20);
+        const emailsU = Array.from(new Set((emails || []).map((x: any)=> String(x||'').trim()).filter(Boolean))).slice(0, 20);
+        const addrU0 = Array.isArray(addresses) ? addresses.map((a: any)=> {
+          if (!a) return '';
+          if (typeof a === 'string') return a.trim();
+          const disp = a.display || a.street || '';
+          const city = a.city || '';
+          const st = a.state || '';
+          const zp = a.postal_code || a.zip || '';
+          const ctry = a.country || '';
+          const s = disp || [a?.line1||a?.address1||'', a?.line2||a?.address2||'', city, st, zp, ctry].filter(Boolean).join(', ');
+          return String(s).trim();
+        }) : [];
+        const addressesU = Array.from(new Set(addrU0.filter(Boolean))).slice(0, 20);
+        if (phonesU.length || emailsU.length || addressesU.length) {
+          await InmateModel.updateOne(
+            { _id: (subject as any)._id },
+            {
+              ...(phonesU.length ? { $addToSet: { 'facts.phones': { $each: phonesU } } } : {}),
+              ...(emailsU.length ? { $addToSet: { 'facts.emails': { $each: emailsU } } } : {}),
+              ...(addressesU.length ? { $addToSet: { 'facts.addresses': { $each: addressesU } } } : {}),
+            }
+          );
+        }
+        // Persist a concise pipl summary on the subject (similar to PDL mapping)
+        try {
+          const piplPhones = Array.isArray(phones) ? phones : [];
+          const piplEmails = Array.isArray(emails) ? emails : [];
+          const piplAddresses = Array.isArray(addresses)
+            ? addresses.map((a: any) => (typeof a === 'string' ? a : (a?.display || a?.street || [a?.line1, a?.city, a?.state, a?.postal_code || a?.zip].filter(Boolean).join(', '))))
+            : [];
+          (subject as any).pipl = { asOf: new Date().toISOString(), matchScore, phones: piplPhones, emails: piplEmails, addresses: piplAddresses };
+          await subject.save();
+        } catch {}
       } catch {}
       // relationships to related_parties
       let upserts = 0;
       const familyTerms = ['mother','father','sister','brother','spouse','wife','husband','son','daughter','parent','sibling','relative','cousin','aunt','uncle','grandmother','grandfather'];
+      const toTitle = (s: string) => s ? (s.charAt(0).toUpperCase() + s.slice(1)) : s;
+      const subjectCity = String((subject as any)?.city || '').trim() || null;
+      // Precompute subject last name (for heuristic when provider doesn't label family)
+      const getSubjectLast = () => {
+        const ln = String(((subject as any)?.last_name || '')).trim();
+        if (ln) return ln;
+        const nm = String(((subject as any)?.name || '')).trim();
+        if (nm) {
+          const parts = nm.split(/\s+/).filter(Boolean);
+          return parts[parts.length - 1] || '';
+        }
+        return '';
+      };
+      const subjLastRaw = String(getSubjectLast().toLowerCase().trim());
+      const normalizeLast = (s: string) => s.toLowerCase().replace(/[^a-z]/g, '').replace(/(.)\1+/g, '$1');
+      const subjLastNorm = subjLastRaw ? normalizeLast(subjLastRaw) : '';
       for (const r of relationships.slice(0, 10)) {
         try {
-          const rel = String(r.type || r.relation || '').toLowerCase();
-          const relationType = familyTerms.some(t => rel.includes(t)) ? 'family' : 'associate';
-          const nameRel = r?.names && r.names[0] ? (r.names[0].display || [r.names[0].first, r.names[0].last].filter(Boolean).join(' ')) : (r.name || null);
-          if (!nameRel) continue;
-          await RelatedPartyModel.updateOne({ subjectId: String(subjectId), partyId: `${nameRel}|${relationType}` }, { $set: { name: nameRel, relationType, confidence: relationType==='family'?0.8:0.6 }, $addToSet: { sources: 'pipl' } }, { upsert: true });
-          upserts++;
+          const relRaw = String((r && (r['@type'] || r.type || r.relation)) || '').toLowerCase();
+          const relationType = relRaw === 'household' ? 'household' : (familyTerms.some(t => relRaw.includes(t)) ? 'family' : 'associate');
+          const relationLabel = (r && (r.type || r.relation || r['@type'])) ? String(r.type || r.relation || r['@type']) : null;
+          // Extract any embedded contacts/addresses for the relationship if present
+          const phonesR = Array.isArray((r as any)?.phones) ? (r as any).phones.map((x: any)=> x?.display_international || x?.number || String(x)).filter(Boolean) : [];
+          const emailsR = Array.isArray((r as any)?.emails) ? (r as any).emails.map((e: any)=> e?.address || String(e)).filter(Boolean) : [];
+          const addressesR = Array.isArray((r as any)?.addresses)
+            ? (r as any).addresses.map((a: any)=> a?.display || [a?.street, a?.city, a?.state, a?.postal_code || a?.zip, a?.country].filter(Boolean).join(', ')).filter(Boolean)
+            : [];
+          // Relationships can include multiple names; upsert for each unique display
+          const namesArr = Array.isArray((r as any)?.names) && (r as any).names.length
+            ? (r as any).names
+            : (r?.name ? [{ display: r.name }] : []);
+          const seenNames = new Set<string>();
+          for (const n of namesArr) {
+            const nameRel = n?.display || [n?.first, n?.middle, n?.last].filter(Boolean).join(' ').trim();
+            const nameClean = String(nameRel || '').trim();
+            if (!nameClean || seenNames.has(nameClean)) continue;
+            seenNames.add(nameClean);
+            // Heuristic: if last name matches subject's last name (with simple normalization), treat as family when label missing
+            let relTypeFinal = relationType;
+            let relLabelFinal = relationLabel;
+            if (!relLabelFinal && subjLastNorm) {
+              const parts = nameClean.split(/\s+/);
+              const last = parts[parts.length - 1] || '';
+              const lastNorm = normalizeLast(last);
+              if (lastNorm && lastNorm === subjLastNorm) {
+                relTypeFinal = 'family';
+                relLabelFinal = 'family';
+              }
+            }
+            const pid = buildPartyId(nameClean, subjectCity, null);
+            await RelatedPartyModel.updateOne(
+              { subjectId: String(subjectId), $or: [ { partyId: pid }, { name: nameClean } ] },
+              {
+                $setOnInsert: { partyId: pid, name: nameClean },
+                $set: { relationType: relTypeFinal, relationLabel: relLabelFinal ? toTitle(String(relLabelFinal)) : undefined, confidence: relTypeFinal==='family'?0.85:(relTypeFinal==='household'?0.7:0.6) },
+                $addToSet: {
+                  sources: 'pipl',
+                  'contacts.phones': { $each: Array.from(new Set(phonesR)) },
+                  'contacts.emails': { $each: Array.from(new Set(emailsR)) },
+                  addresses: { $each: Array.from(new Set(addressesR)) },
+                },
+                $push: { audits: { at: new Date(), step: 'pipl_first_pull', provider: 'pipl', personsCount: Array.isArray(body?.possible_persons)? body.possible_persons.length : (body?.person?1:0), match: matchScore || 0, accepted: true, acceptance: 'SCORE', matchMin: 0, requireUnique: false, lastNameAgrees: null } }
+              },
+              { upsert: true }
+            );
+            upserts++;
+          }
         } catch {}
       }
-  return res.json({ ok: true, subjectId: String(subjectId), request: { person: pPerson }, matchScore, chosenSummary: { phones, emails, addresses }, relationshipsFound: relationships.length, relatedPartiesUpserted: upserts });
+  const candidateName = [pf, pl].filter(Boolean).join(' ').trim() || null;
+  return res.json({ ok: true, subjectId: String(subjectId), candidateName, request: { person: pPerson }, matchScore, chosenSummary: { phones, emails, addresses }, relationshipsFound: relationships.length, relatedPartiesUpserted: upserts });
+    } catch (e: any) {
+      res.status(500).json({ ok: false, error: String(e) });
+    }
+  });
+
+  // POST /api/enrichment/related_party_override { subjectId, partyId?: string, name?: string, relationType?: 'family'|'household'|'associate'|'unknown', relationLabel?: string, confidence?: number }
+  // Small administrative helper to correct relationship classification for specific parties
+  router.post('/enrichment/related_party_override', async (req: any, res: any) => {
+    try {
+      const { subjectId, partyId, name, relationType, relationLabel, confidence } = req.body || {};
+      if (!subjectId) return res.status(400).json({ ok: false, error: 'MISSING_SUBJECT_ID' });
+      if (!partyId && !name) return res.status(400).json({ ok: false, error: 'MISSING_PARTY_SELECTOR' });
+      const q: any = { subjectId: String(subjectId) };
+      if (partyId) q.partyId = String(partyId);
+      if (name && !partyId) q.name = String(name);
+      const patch: any = {};
+      if (relationType) patch.relationType = relationType;
+      if (relationLabel != null) patch.relationLabel = String(relationLabel);
+      if (typeof confidence === 'number') patch.confidence = confidence;
+      if (!Object.keys(patch).length) return res.status(400).json({ ok: false, error: 'NO_FIELDS_TO_UPDATE' });
+      const r = await RelatedPartyModel.updateOne(q, { $set: patch });
+      return res.json({ ok: true, matched: r.matchedCount || (r as any).nMatched || 0, modified: r.modifiedCount || (r as any).nModified || 0 });
     } catch (e: any) {
       res.status(500).json({ ok: false, error: String(e) });
     }
@@ -1207,7 +1648,7 @@ export async function createServer() {
       }
       // persist raw
       try {
-        await RawProviderPayloadModel.create({ provider: 'pdl', step: 'pdl_first_pull', payload: { request: { name, location, dob }, response: body, bestScore: matchScore }, ttlExpiresAt: new Date(Date.now() + (config as any).rawPayloadTtlHours * 3600 * 1000) });
+        await RawProviderPayloadModel.create({ provider: 'pdl', subjectId: String(subjectId), step: 'pdl_first_pull', payload: { request: { name, location, dob }, response: body, bestScore: matchScore }, ttlExpiresAt: new Date(Date.now() + (config as any).rawPayloadTtlHours * 3600 * 1000) });
       } catch {}
       // update subject minimal mapping & facts
       if (chosen) {
@@ -1255,7 +1696,8 @@ export async function createServer() {
           upserts++;
         } catch {}
       }
-      return res.json({ ok: true, subjectId: sid, request: { name, location, dob }, matchScore, chosenSummary: chosen ? { phones: chosen.phones||[], emails: chosen.emails||[], addresses: chosen.addresses||[], usernames: chosen.usernames||[], user_ids: chosen.user_ids||[] } : null, relationshipsFound: relations.length, relatedPartiesUpserted: upserts });
+  const candidateName = name || null;
+  return res.json({ ok: true, subjectId: sid, candidateName, request: { name, location, dob }, matchScore, chosenSummary: chosen ? { phones: chosen.phones||[], emails: chosen.emails||[], addresses: chosen.addresses||[], usernames: chosen.usernames||[], user_ids: chosen.user_ids||[] } : null, relationshipsFound: relations.length, relatedPartiesUpserted: upserts });
     } catch (e: any) {
       res.status(500).json({ ok: false, error: String(e) });
     }
@@ -1266,15 +1708,74 @@ export async function createServer() {
     try {
       const subjectId = String(req.query.subjectId || '').trim();
       if (!subjectId) return res.status(400).json({ ok: false, error: 'MISSING_SUBJECT_ID' });
-      const rowsRaw = await RelatedPartyModel.find({ subjectId: subjectId }, { _id: 0, subjectId: 1, partyId: 1, name: 1, relationType: 1, confidence: 1, sources: 1, createdAt: 1, updatedAt: 1, audits: 1 })
+      const rowsRaw = await RelatedPartyModel.find(
+        { subjectId: subjectId },
+        {
+          _id: 0,
+          subjectId: 1,
+          partyId: 1,
+          name: 1,
+          relationType: 1,
+          confidence: 1,
+          sources: 1,
+          createdAt: 1,
+          updatedAt: 1,
+          audits: 1,
+          // Include contact fields for UI counts and details
+          'contacts.phones': 1,
+          'contacts.emails': 1,
+          addresses: 1,
+        }
+      )
         .sort({ updatedAt: -1 })
         .limit(100)
         .lean();
+      const getSubjLastFor = async (sid: string) => {
+        try {
+          const subj = await InmateModel.findOne({ $or: [ { spn: sid }, { subject_id: sid }, { subjectId: sid } ] }, { last_name: 1, name: 1 }).lean();
+          const ln = String((subj as any)?.last_name || '').trim();
+          if (ln) return ln;
+          const nm = String((subj as any)?.name || '').trim();
+          if (nm) { const parts = nm.split(/\s+/).filter(Boolean); return parts[parts.length-1]||''; }
+        } catch {}
+        return '';
+      };
+      const norm = (s: string) => String(s||'').toLowerCase().replace(/[^a-z]/g,'').replace(/(.)\1+/g,'$1');
+      const subjLastNorm = norm(await getSubjLastFor(subjectId));
       const rows = rowsRaw.map((p: any) => {
         const audits = Array.isArray(p.audits) ? p.audits : [];
         const lastAudit = audits.length ? audits[audits.length - 1] : null;
-        const auditLite = lastAudit ? { at: lastAudit.at, provider: lastAudit.provider, personsCount: lastAudit.personsCount, match: lastAudit.match, accepted: lastAudit.accepted, acceptance: lastAudit.acceptance, lastNameAgrees: lastAudit.lastNameAgrees, matchMin: lastAudit.matchMin, requireUnique: lastAudit.requireUnique } : null;
-        return { subjectId: p.subjectId, partyId: p.partyId, name: p.name, relationType: p.relationType, confidence: p.confidence, sources: p.sources, createdAt: p.createdAt, updatedAt: p.updatedAt, lastAudit: auditLite };
+  const auditLite = lastAudit ? { at: lastAudit.at, provider: lastAudit.provider, personsCount: lastAudit.personsCount, match: normalizeMatch((lastAudit as any).match), accepted: lastAudit.accepted, acceptance: lastAudit.acceptance, lastNameAgrees: lastAudit.lastNameAgrees, matchMin: lastAudit.matchMin, requireUnique: lastAudit.requireUnique, gainedData: (lastAudit as any).gainedData ?? null, netNewPhones: (lastAudit as any).netNewPhones ?? null, netNewEmails: (lastAudit as any).netNewEmails ?? null, netNewAddresses: (lastAudit as any).netNewAddresses ?? null } : null;
+        const lastTargeted = audits.filter((a: any) => a && a.targeted === true).pop() || null;
+        const lastTargetedAt = lastTargeted?.at ? new Date(lastTargeted.at) : null;
+        const cooldownEndsAt = (lastTargetedAt && PARTY_PULL_COOLDOWN_MINUTES)
+          ? new Date(lastTargetedAt.getTime() + PARTY_PULL_COOLDOWN_MINUTES * 60 * 1000)
+          : null;
+        const phones = Array.isArray((p as any)?.contacts?.phones) ? (p as any).contacts.phones : [];
+        const emails = Array.isArray((p as any)?.contacts?.emails) ? (p as any).contacts.emails : [];
+        const addresses = Array.isArray((p as any)?.addresses) ? (p as any).addresses : [];
+        let relationType = p.relationType;
+        let relationLabel = (p as any).relationLabel || null;
+        if ((!relationLabel || relationLabel.toLowerCase() === 'associate') && subjLastNorm && p?.name) {
+          const parts = String(p.name).split(/\s+/); const last = parts[parts.length-1]||'';
+          if (norm(last) === subjLastNorm) { relationType = 'family'; relationLabel = relationLabel || 'family'; }
+        }
+        return {
+          subjectId: p.subjectId,
+          partyId: p.partyId,
+          name: p.name,
+          relationType,
+          relationLabel,
+          confidence: p.confidence,
+          sources: p.sources,
+          createdAt: p.createdAt,
+          updatedAt: p.updatedAt,
+          lastAudit: auditLite,
+          lastTargetedAt,
+          cooldownEndsAt,
+          contacts: { phones, emails },
+          addresses,
+        };
       });
       res.json({ ok: true, count: rows.length, rows });
     } catch (e: any) {
@@ -1282,21 +1783,54 @@ export async function createServer() {
     }
   });
 
-  // POST /api/enrichment/related_party_pull { subjectId, maxParties?: 3, requireUnique?: true, matchMin?: 0.85 }
+  // POST /api/enrichment/related_party_pull { subjectId, maxParties?: 3, requireUnique?: true, matchMin?: 0.85, partyId?: string, partyName?: string, aggressive?: boolean, preferStatewide?: boolean, force?: boolean }
   // For the subject's related parties, query Pipl by name + city/state and upsert phones/emails/addresses into related_parties
   router.post('/enrichment/related_party_pull', async (req: any, res: any) => {
     try {
       if (!(config as any).piplApiKey || !(config as any).providerPiplEnabled) return res.status(400).json({ ok: false, error: 'PIPL_DISABLED_OR_MISSING_KEY' });
-      const { subjectId, maxParties = 3, requireUnique = true, matchMin = 0.85 } = req.body || {};
+  const { subjectId, maxParties = 3, requireUnique = true, matchMin = DEFAULT_MATCH_MIN, partyId, partyName, aggressive = false, preferStatewide: preferStatewideRaw, force: forceRaw } = req.body || {};
       if (!subjectId) return res.status(400).json({ ok: false, error: 'MISSING_SUBJECT_ID' });
       const subject = await InmateModel.findOne({ $or: [{ spn: subjectId }, { subject_id: subjectId }, { subjectId }] }, { city: 1, state: 1 }).lean();
       if (!subject) return res.status(404).json({ ok: false, error: 'SUBJECT_NOT_FOUND' });
-      const city = String((subject as any).city || 'Katy');
+  const city = String((subject as any).city || 'Katy');
       const state = String((subject as any).state || 'TX');
+  const hasCity = !!(subject as any).city && String((subject as any).city).trim().length > 0;
       // pick related parties lacking contacts first
-  const parties = await RelatedPartyModel.find({ subjectId: String(subjectId) }, { name: 1, relationType: 1, confidence: 1, contacts: 1, partyId: 1 }).sort({ updatedAt: -1 }).limit(20).lean();
+  const parties = await RelatedPartyModel.find({ subjectId: String(subjectId) }, { name: 1, relationType: 1, confidence: 1, contacts: 1, partyId: 1, audits: 1, updatedAt: 1 }).sort({ updatedAt: -1 }).limit(20).lean();
       const need = parties.filter((p: any) => !p?.contacts || ((!Array.isArray(p.contacts.phones) || p.contacts.phones.length === 0) && (!Array.isArray(p.contacts.emails) || p.contacts.emails.length === 0)));
-      const candidates = (need.length ? need : parties).slice(0, Math.max(1, Math.min(10, Number(maxParties))));
+      // If a target party is specified, restrict to just that party
+      const targeted = !!(partyId || partyName);
+      let pool = (need.length ? need : parties);
+      if (targeted) {
+        const pid = partyId ? String(partyId) : '';
+        const pnm = partyName ? String(partyName).toLowerCase().trim() : '';
+        pool = pool.filter((p: any) => {
+          const matchesId = pid && String((p as any).partyId || '') === pid;
+          const matchesName = pnm && String((p as any).name || '').toLowerCase().trim() === pnm;
+          return matchesId || matchesName;
+        });
+        // If nothing matches the target, return early with a benign response
+        if (!pool.length) {
+          return res.json({ ok: true, subjectId: String(subjectId), city, state, targeted: true, tried: 0, updated: 0, skipped: 0, details: [{ target: { partyId: pid || null, partyName: pnm || null }, reason: 'TARGET_NOT_FOUND' }] });
+        }
+      }
+  // Cooldown to avoid repeated enrich of the same party within a small window (can be bypassed when force=true)
+  const cooldownMinutes = PARTY_PULL_COOLDOWN_MINUTES;
+      const force = String(forceRaw ?? 'false').toLowerCase() === 'true';
+      const cutoff = cooldownMinutes ? new Date(Date.now() - cooldownMinutes * 60 * 1000) : null;
+      // If targeted and the last targeted audit is within cooldown, skip before calling provider
+      if (targeted && cutoff && !force) {
+        const c = pool[0];
+        const audits = Array.isArray((c as any).audits) ? (c as any).audits : [];
+        const last = audits.length ? audits[audits.length - 1] : null;
+        const lastAt = last?.at ? new Date(last.at) : null;
+        const lastWasTargeted = last?.targeted === true;
+        if (lastAt && lastAt >= cutoff && lastWasTargeted) {
+          const nextEligibleAt = new Date(lastAt.getTime() + cooldownMinutes * 60 * 1000);
+          return res.json({ ok: true, subjectId: String(subjectId), city, state, targeted: true, tried: 0, updated: 0, skipped: 1, cooldownActive: true, cooldownMinutes, lastTargetedAt: lastAt, nextEligibleAt, details: [{ partyId: (c as any).partyId || null, name: (c as any).name || null, reason: 'COOLDOWN_ACTIVE' }] });
+        }
+      }
+      const candidates = pool.slice(0, Math.max(1, Math.min(10, Number(maxParties))));
       let tried = 0, updated = 0, skipped = 0;
       const details: any[] = [];
       function splitName(n: string){
@@ -1306,23 +1840,80 @@ export async function createServer() {
         return { first: parts.slice(0, -1).join(' '), last: parts[parts.length - 1] };
       }
       for (const p of candidates) {
+        // Per-party cooldown check when not strictly targeted early-returned
+        if (cutoff && !force) {
+          const audits = Array.isArray((p as any).audits) ? (p as any).audits : [];
+          const last = audits.length ? audits[audits.length - 1] : null;
+          const lastAt = last?.at ? new Date(last.at) : null;
+          const lastWasTargeted = last?.targeted === true;
+          if (lastAt && lastAt >= cutoff && lastWasTargeted) {
+            skipped++;
+            details.push({ partyId: (p as any).partyId || null, name: (p as any).name || null, reason: 'COOLDOWN_ACTIVE' });
+            continue;
+          }
+        }
         tried++;
         const nm = String(p.name || '').trim();
         if (!nm) { skipped++; details.push({ name: nm, reason: 'EMPTY_NAME' }); continue; }
         const { first, last } = splitName(nm);
-        const person: any = { names: [{ first, last }], addresses: [{ city, state, country: 'US' }] };
-        const bodyReq = { key: (config as any).piplApiKey, person };
-        let data: any = null; let httpStatus = 0;
+        // Attempt 1: smart-first
+        // - If request explicitly sets preferStatewide, honor it
+        // - Else if config.partyPullPreferStatewide is true, use state-only
+        // - Else if city is present (not fallback), use city+state
+        // - Else (no reliable city), use state-only
+        const preferStatewide = (typeof preferStatewideRaw === 'boolean')
+          ? preferStatewideRaw
+          : ( (config as any).partyPullPreferStatewide || !hasCity );
+        const personCity: any = preferStatewide
+          ? { names: [{ first, last }], addresses: [{ state, country: 'US' }] }
+          : { names: [{ first, last }], addresses: [{ city, state, country: 'US' }] };
+        const bodyReq1 = { key: (config as any).piplApiKey, person: personCity };
+        let data: any = null; let httpStatus = 0; let attempt = 1;
         try {
-          const r = await fetch('https://api.pipl.com/search/', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(bodyReq) } as any);
+          const r = await fetch('https://api.pipl.com/search/', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(bodyReq1) } as any);
           httpStatus = r.status;
           const t = await r.text();
           try { data = JSON.parse(t); } catch { data = {}; }
-          await RawProviderPayloadModel.create({ provider: 'pipl', step: 'pipl_party_pull', payload: { request: { subjectId, name: nm, person }, response: data }, ttlExpiresAt: new Date(Date.now() + (config as any).rawPayloadTtlHours * 3600 * 1000) });
+          await RawProviderPayloadModel.create({ provider: 'pipl', subjectId: String(subjectId), step: 'pipl_party_pull', payload: { request: { subjectId, name: nm, person: personCity, attempt }, response: data }, ttlExpiresAt: new Date(Date.now() + (config as any).rawPayloadTtlHours * 3600 * 1000) });
         } catch (e: any) {
           details.push({ name: nm, error: String(e) }); skipped++; continue;
         }
-  const personsCount = Number(data?.['@persons_count'] || 0);
+        let personsCount = Number(data?.['@persons_count'] || 0);
+        // Only attempt fallbacks when aggressive=true to avoid multiple chargeable calls per click
+        if (!personsCount && aggressive) {
+          attempt = 2;
+          // If first was city+state, try state-only; if first was already state-only, skip to simplified-first
+          if (!preferStatewide) {
+            const personState: any = { names: [{ first, last }], addresses: [{ state, country: 'US' }] };
+            const bodyReq2 = { key: (config as any).piplApiKey, person: personState };
+            try {
+              const r2 = await fetch('https://api.pipl.com/search/', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(bodyReq2) } as any);
+              httpStatus = r2.status;
+              const t2 = await r2.text();
+              let data2: any = {};
+              try { data2 = JSON.parse(t2); } catch { data2 = {}; }
+              await RawProviderPayloadModel.create({ provider: 'pipl', subjectId: String(subjectId), step: 'pipl_party_pull', payload: { request: { subjectId, name: nm, person: personState, attempt }, response: data2 }, ttlExpiresAt: new Date(Date.now() + (config as any).rawPayloadTtlHours * 3600 * 1000) });
+              const pc2 = Number(data2?.['@persons_count'] || 0);
+              if (pc2) { data = data2; personsCount = pc2; }
+            } catch (e: any) {}
+          }
+        }
+        if (!personsCount && aggressive) {
+          attempt = 3;
+          const firstSimple = String(first || '').split(/\s+/).filter(Boolean)[0] || String(first || '');
+          const personSimple: any = { names: [{ first: firstSimple, last }], addresses: [{ state, country: 'US' }] };
+          const bodyReq3 = { key: (config as any).piplApiKey, person: personSimple };
+          try {
+            const r3 = await fetch('https://api.pipl.com/search/', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(bodyReq3) } as any);
+            httpStatus = r3.status;
+            const t3 = await r3.text();
+            let data3: any = {};
+            try { data3 = JSON.parse(t3); } catch { data3 = {}; }
+            await RawProviderPayloadModel.create({ provider: 'pipl', subjectId: String(subjectId), step: 'pipl_party_pull', payload: { request: { subjectId, name: nm, person: personSimple, attempt }, response: data3 }, ttlExpiresAt: new Date(Date.now() + (config as any).rawPayloadTtlHours * 3600 * 1000) });
+            const pc3 = Number(data3?.['@persons_count'] || 0);
+            if (pc3) { data = data3; personsCount = pc3; }
+          } catch (e: any) {}
+        }
         // Normalize a "best match"
         const extract = (pp: any) => {
           const m = typeof pp?.['@match'] === 'number' ? pp['@match'] : (typeof data?.['@match'] === 'number' ? data['@match'] : 0.0);
@@ -1350,34 +1941,46 @@ export async function createServer() {
           await RelatedPartyModel.updateOne(
             { subjectId: String(subjectId), $or: [ { partyId: String((p as any).partyId || '') }, { name: nm } ] },
             { $setOnInsert: { partyId: (p as any).partyId || buildPartyId(nm, city, null), name: nm },
-              $push: { audits: { at: new Date(), step: 'pipl_party_pull', provider: 'pipl', personsCount, match: best?.m || 0, accepted, acceptance, matchMin: Number(matchMin), requireUnique: !!requireUnique, lastNameAgrees: !!lastOk, queriedName: nm, city, state } } },
+              $push: { audits: { at: new Date(), step: 'pipl_party_pull', provider: 'pipl', personsCount, match: best?.m || 0, accepted, acceptance, matchMin: Number(matchMin), requireUnique: !!requireUnique, lastNameAgrees: !!lastOk, queriedName: nm, city, state, targeted, preferStatewide: !!(typeof preferStatewideRaw === 'boolean' ? preferStatewideRaw : ((config as any).partyPullPreferStatewide || !hasCity)), forced: !!force } } },
             { upsert: true }
           );
         } catch {}
         if (!accepted) {
           skipped++;
-          details.push({ name: nm, personsCount, match: best?.m || 0, accepted: false });
+          details.push({ partyId: (p as any).partyId || null, name: nm, personsCount, match: best?.m || 0, accepted: false });
           continue;
         }
-        // Upsert contacts/addresses to related_parties
+        // Upsert contacts/addresses to related_parties with value gate (net new data)
         try {
-          const phonesU = Array.from(new Set((best.phones||[]).map((x: any)=> String(x).trim()).filter(Boolean))).slice(0, 10);
-          const emailsU = Array.from(new Set((best.emails||[]).map((x: any)=> String(x).trim()).filter(Boolean))).slice(0, 10);
-          const addrsU = Array.from(new Set((best.addresses||[]).map((x: any)=> String(x).trim()).filter(Boolean))).slice(0, 10);
+          const phonesU = Array.from(new Set((best.phones||[]).map((x: any)=> String(x).trim()).filter(Boolean))).slice(0, 10) as string[];
+          const emailsU = Array.from(new Set((best.emails||[]).map((x: any)=> String(x).trim()).filter(Boolean))).slice(0, 10) as string[];
+          // Filter out trivial country-only addresses
+          const isTrivialAddr = (s: string) => /^(united\s*states|usa|u\.?s\.?)$/i.test(s.trim());
+          const addrsU = Array.from(new Set((best.addresses||[]).map((x: any)=> String(x).trim()).filter(Boolean).filter((s: string)=> !isTrivialAddr(s)))).slice(0, 10) as string[];
           const pid = buildPartyId(nm, (subject as any)?.city || null, null);
+          // Compute net new by comparing with current stored values
+          const existing = await RelatedPartyModel.findOne({ subjectId: String(subjectId), $or: [ { partyId: pid }, { name: nm } ] }, { 'contacts.phones': 1, 'contacts.emails': 1, addresses: 1 }).lean();
+          const existingPhones = new Set<string>(Array.isArray((existing as any)?.contacts?.phones) ? (existing as any).contacts.phones.map((s: any)=> String(s)) : []);
+          const existingEmails = new Set<string>(Array.isArray((existing as any)?.contacts?.emails) ? (existing as any).contacts.emails.map((s: any)=> String(s)) : []);
+          const existingAddresses = new Set<string>(Array.isArray((existing as any)?.addresses) ? (existing as any).addresses.map((s: any)=> String(s)) : []);
+          const netPhones = phonesU.filter((v) => !existingPhones.has(v));
+          const netEmails = emailsU.filter((v) => !existingEmails.has(v));
+          const netAddrs = addrsU.filter((v) => !existingAddresses.has(v));
+          const gainedData = (netPhones.length + netEmails.length + netAddrs.length) > 0;
           await RelatedPartyModel.updateOne(
             { subjectId: String(subjectId), $or: [ { partyId: pid }, { name: nm } ] },
             { $setOnInsert: { partyId: pid, name: nm },
-              $addToSet: { sources: 'pipl', 'contacts.phones': { $each: phonesU }, 'contacts.emails': { $each: emailsU }, addresses: { $each: addrsU } } },
+              $addToSet: { sources: 'pipl', 'contacts.phones': { $each: netPhones }, 'contacts.emails': { $each: netEmails }, addresses: { $each: netAddrs } },
+              $push: { audits: { at: new Date(), step: 'pipl_party_pull', provider: 'pipl', personsCount, match: best.m || 0, accepted: true, acceptance: (acceptByScore?'SCORE':'UNIQUE'), matchMin: Number(matchMin), requireUnique: !!requireUnique, lastNameAgrees: !!lastOk, queriedName: nm, city, state, targeted, preferStatewide: !!(typeof preferStatewideRaw === 'boolean' ? preferStatewideRaw : ((config as any).partyPullPreferStatewide || !hasCity)), forced: !!force, gainedData, netNewPhones: netPhones.length, netNewEmails: netEmails.length, netNewAddresses: netAddrs.length } } },
             { upsert: true }
           );
           updated++;
-          details.push({ name: nm, accepted: true, personsCount, match: best.m || 0, phones: phonesU.length, emails: emailsU.length, addresses: addrsU.length });
+          details.push({ partyId: (p as any).partyId || pid, name: nm, accepted: true, personsCount, match: best.m || 0, netNew: { phones: netPhones.length, emails: netEmails.length, addresses: netAddrs.length }, gainedData });
         } catch (e: any) {
-          details.push({ name: nm, error: String(e) }); skipped++; continue;
+          details.push({ partyId: (p as any).partyId || null, name: nm, error: String(e) }); skipped++; continue;
         }
       }
-      res.json({ ok: true, subjectId: String(subjectId), city, state, tried, updated, skipped, details });
+  res.json({ ok: true, subjectId: String(subjectId), city, state, targeted, tried, updated, skipped, details, cooldownMinutes, forced: !!force })
     } catch (e: any) {
       res.status(500).json({ ok: false, error: String(e) });
     }
@@ -1393,7 +1996,7 @@ export async function createServer() {
       const maxSubjects = Math.max(1, Math.min(25, Number(req.body?.maxSubjects || 5)));
       const maxParties = Math.max(1, Math.min(10, Number(req.body?.maxParties || 3)));
       const requireUnique = String(req.body?.requireUnique ?? 'true').toLowerCase() === 'true';
-      const matchMin = Number(req.body?.matchMin ?? 0.85);
+  const matchMin = Number(req.body?.matchMin ?? DEFAULT_MATCH_MIN);
       // Build subject list
       let targets: string[] = [];
       if (subjectIds.length) {
@@ -1443,6 +2046,16 @@ export async function createServer() {
         let wrote = 0;
         for (let i = 0; i < hits.length; i++) {
           const h: any = hits[i];
+          // Persist raw payload for admin review and auditability
+          try {
+            await RawProviderPayloadModel.create({
+              provider: 'whitepages',
+              subjectId: String(subjectId),
+              step: 'whitepages_phone_lookup',
+              payload: { request: { phone: String(phones[i] || '') }, response: h },
+              ttlExpiresAt: new Date(Date.now() + (config as any).rawPayloadTtlHours * 3600 * 1000)
+            });
+          } catch {}
           try {
             await RelatedPartyModel.updateOne(
               { subjectId: String(subjectId), partyId: String((p as any).partyId) },
@@ -1479,13 +2092,23 @@ export async function createServer() {
       for (const r of rows) {
         const a = Array.isArray((r as any).audits) ? (r as any).audits : [];
         for (const ent of a) {
-          audits.push({ subjectId: r.subjectId, partyId: r.partyId, name: r.name, at: ent.at, provider: ent.provider, personsCount: ent.personsCount, match: ent.match, accepted: ent.accepted, acceptance: ent.acceptance, lastNameAgrees: ent.lastNameAgrees, matchMin: ent.matchMin, requireUnique: ent.requireUnique, city: ent.city, state: ent.state });
+          audits.push({ subjectId: r.subjectId, partyId: r.partyId, name: r.name, at: ent.at, provider: ent.provider, personsCount: ent.personsCount, match: ent.match, accepted: ent.accepted, acceptance: ent.acceptance, lastNameAgrees: ent.lastNameAgrees, matchMin: ent.matchMin, requireUnique: ent.requireUnique, city: ent.city, state: ent.state, targeted: ent.targeted === true, preferStatewide: (ent as any).preferStatewide ?? null, forced: (ent as any).forced === true, gainedData: (ent as any).gainedData ?? null, netNewPhones: (ent as any).netNewPhones ?? null, netNewEmails: (ent as any).netNewEmails ?? null, netNewAddresses: (ent as any).netNewAddresses ?? null });
         }
       }
       audits.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
       const accepted = audits.filter((x) => x.accepted).length;
       const rejected = audits.length - accepted;
-      const summary = { totalAudits: audits.length, accepted, rejected, acceptanceRatePct: audits.length ? Math.round((accepted / audits.length) * 1000) / 10 : 0 };
+      const lastTargetedAt = (() => {
+        let t: Date | null = null;
+        for (const a of audits) {
+          if (a.targeted) {
+            const d = new Date(a.at);
+            if (!t || d > t) t = d;
+          }
+        }
+        return t;
+      })();
+      const summary = { totalAudits: audits.length, accepted, rejected, acceptanceRatePct: audits.length ? Math.round((accepted / audits.length) * 1000) / 10 : 0, lastTargetedAt };
       res.json({ ok: true, count: audits.length, summary, rows: audits.slice(0, 500) });
     } catch (e: any) {
       res.status(500).json({ ok: false, error: String(e) });
@@ -1575,6 +2198,7 @@ export async function createServer() {
     <div class="row"><strong>Provider Stats (24h)</strong><span class="muted" id="prov-ts"></span></div>
     <div class="kpi" id="prov-kpi"></div>
     <pre class="muted" id="prov-json" style="white-space:pre-wrap"></pre>
+    <div class="muted" id="prov-hint" style="margin-top:6px"></div>
   </div>
   <div class="card" id="prov_unres" data-view="enrich">
     <div class="row"><strong>Provider Unresolved Breakdown (24h)</strong><span class="muted" id="provun-ts"></span></div>
@@ -1737,6 +2361,20 @@ async function loadProviders(){
     document.getElementById('prov-kpi').textContent=k;
     document.getElementById('prov-json').textContent=JSON.stringify(j,null,2);
     document.getElementById('prov-ts').textContent=new Date().toLocaleTimeString();
+    // Also load provider list to show a helpful hint when only one or none are enabled
+    try{
+      const pr = await fetch('enrichment/providers');
+      if (pr.ok){
+        const pj = await pr.json();
+        const list = Array.isArray(pj.providers) ? pj.providers.filter((p)=>p.enabled) : [];
+        const hintEl = document.getElementById('prov-hint');
+        if (list.length <= 1){
+          hintEl.textContent = 'Hint: Only '+(list.length||0)+' provider enabled. To enable more, set PROVIDER_*_ENABLED=true and API keys in enrichment .env, then restart the API.';
+        } else {
+          hintEl.textContent = '';
+        }
+      }
+    }catch(e){ /* ignore hint errors */ }
   }catch(e){ document.getElementById('prov-kpi').textContent='Error loading provider stats: '+e; }
 }
 async function loadQueue(){

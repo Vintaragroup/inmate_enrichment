@@ -68,6 +68,11 @@ const MatchAuditSchema = new Schema(
     queriedName: String,
     city: String,
     state: String,
+    // Value gate fields: record whether this run added new data
+    gainedData: { type: Boolean },
+    netNewPhones: { type: Number },
+    netNewEmails: { type: Number },
+    netNewAddresses: { type: Number },
   },
   { _id: false }
 );
@@ -77,6 +82,8 @@ const RelatedPartySchema = new Schema(
     partyId: { type: String, index: true },
     name: String,
     relationType: { type: String, enum: ['family', 'household', 'associate', 'unknown'], default: 'unknown' },
+    // Optional human-readable relation label from the provider (e.g., "spouse", "brother")
+    relationLabel: { type: String },
     confidence: Number,
     evidence: [new Schema({ type: String, value: String, weight: Number, provider: String }, { _id: false })],
     contacts: new Schema({ phones: [String], emails: [String] }, { _id: false }),
@@ -90,7 +97,14 @@ export const RelatedPartyModel = mongoose.models.related_parties || mongoose.mod
 
 // Raw provider payloads
 const RawPayloadSchema = new Schema(
-  { jobId: { type: String, index: true }, provider: { type: String, index: true }, step: { type: String, index: true }, payload: Schema.Types.Mixed, ttlExpiresAt: { type: Date } },
+  {
+    jobId: { type: String, index: true },
+    subjectId: { type: String, index: true },
+    provider: { type: String, index: true },
+    step: { type: String, index: true },
+    payload: Schema.Types.Mixed,
+    ttlExpiresAt: { type: Date },
+  },
   { timestamps: true }
 );
 RawPayloadSchema.index({ ttlExpiresAt: 1 }, { expireAfterSeconds: 0 });
