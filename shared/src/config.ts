@@ -41,7 +41,7 @@ export const config = {
   // HCSO scraping
   hcsoEnabled: (process.env.HCSO_SCRAPE_ENABLED || 'false').toLowerCase() === 'true',
   hcsoBaseUrl: process.env.HCSO_BASE_URL || 'https://www.harriscountyso.org',
-  hcsoMode: (process.env.HCSO_SCRAPE_MODE || 'browser').toLowerCase() as 'browser' | 'http',
+  hcsoMode: (process.env.HCSO_SCRAPE_MODE || 'http').toLowerCase() as 'browser' | 'http',
     // Provider budgets/costs
     pdlUnitCostUsd: Number(process.env.PDL_UNIT_COST_USD || 0),
   piplUnitCostUsd: Number(process.env.PIPL_UNIT_COST_USD || 0),
